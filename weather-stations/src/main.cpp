@@ -1,13 +1,11 @@
 #include <iostream>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <map>
-#include <limits>
 #include <iomanip>
 #include <vector>
 #include <algorithm>
+#include <charconv>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -17,12 +15,12 @@
 int main(int argc, char* argv[])
 {
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <input file> <number of threads>" << std::endl;
+        std::cerr << "Usage: " << argv[0]
+                  << " <input file> <number of threads>" << std::endl;
         return 1;
     }
     const char* file = argv[1];
-    
-    // Open file using OS-level calls and mmap it.
+
     int fd = open(file, O_RDONLY);
     if (fd == -1) {
         std::cerr << "Unable to open '" << file << "'" << std::endl;
@@ -36,94 +34,112 @@ int main(int argc, char* argv[])
         return 1;
     }
     size_t filesize = sb.st_size;
-    char* fileData = static_cast<char*>(mmap(nullptr, filesize, PROT_READ, MAP_PRIVATE, fd, 0));
+    char* fileData = static_cast<char*>(mmap(nullptr, filesize, PROT_READ,
+                                               MAP_PRIVATE, fd, 0));
     close(fd);
     if (fileData == MAP_FAILED) {
         std::cerr << "Error mapping file" << std::endl;
         return 1;
     }
-    
-    // Create a string view of the entire file and then split into lines.
-    std::string_view fileContent(fileData, filesize);
-    std::vector<std::string_view> lines;
-    size_t pos = 0;
-    while (pos < fileContent.size()) {
-        size_t next = fileContent.find('\n', pos);
-        if (next == std::string_view::npos) {
-            lines.push_back(fileContent.substr(pos));
-            break;
-        } else {
-            lines.push_back(fileContent.substr(pos, next - pos));
-            pos = next + 1;
-        }
-    }
-    // Not unmapping until we've finished processing
-    // (You can later call munmap(fileData, filesize) before return.)
 
-    std::cout << std::fixed << std::setprecision(1);
+    std::string_view fileContent(fileData, filesize);
+
     unsigned int numThreads = std::stoi(argv[2]);
+    std::cout << std::fixed << std::setprecision(1);
     std::cout << "Number of threads: " << numThreads << std::endl;
 
-    // Prepare local maps, one per task chunk.
-    std::vector<std::map<std::string, WSData>> localMaps(numThreads);
+    // Determine chunk boundaries for each thread without copying lines.
+    // Each chunk is defined by it's starting and ending index in the fileContent.
+    std::vector<std::pair<size_t, size_t>> chunks;
+    size_t approxChunkSize = filesize / (numThreads);
+    size_t startOffset = 0;
+    for (unsigned int tid = 0; tid < numThreads; ++tid) {
+        size_t chunkStart = startOffset;
+        size_t chunkEnd;
+        if (tid == numThreads - 1) {
+            chunkEnd = filesize;
+        } else {
+            chunkEnd = chunkStart + approxChunkSize;
+            // verify that the chuck ends at a newline
+            // size_t newlinePos = fileContent.find('\n', chunkEnd);
+            // if (newlinePos != std::string_view::npos)
+            //     chunkEnd = newlinePos;
+            // else
+            //     chunkEnd = filesize;
 
-    // Lambda function for processing a chunk of lines.
+            while(fileContent[chunkEnd] != '\n' && chunkEnd < filesize)
+            {
+                chunkEnd++;
+            }
+        }
+        chunks.emplace_back(chunkStart, chunkEnd);
+        // Set next startOffset; if not at end, skip past the newline.
+        startOffset = (chunkEnd < filesize) ? chunkEnd + 1 : chunkEnd;
+    }
+
+    std::vector<std::map<std::string_view, WSData>> localMaps(numThreads);
+
+    // Lambda for processing a chunk of fileContent.
     auto worker = [&](size_t start, size_t end, unsigned int tid) {
-        for (size_t i = start; i < end; i++) {
-            std::string_view line = lines[i];
-            size_t delim = line.find(';');
-            if (delim != std::string_view::npos) {
-                // Extract stationName and temp as string_views.
-                std::string stationName(line.substr(0, delim));
-                std::string tempStr(std::string(line.substr(delim + 1)));
-                float temperature = std::stof(tempStr);
-                auto& data = localMaps[tid][stationName];
-                if (data.count == 0) {
-                    data.name = stationName;
-                    data.sum = temperature;
-                    data.count = 1;
-                    data.min = temperature;
-                    data.max = temperature;
-                } else {
-                    data.sum += temperature;
-                    data.count++;
-                    if (temperature < data.min)
+        size_t pos = start;
+        while (pos < end) {
+            size_t next = fileContent.find('\n', pos);
+            if (next == std::string_view::npos || next > end)
+                next = end;
+            if (pos < next) {
+                std::string_view line = fileContent.substr(pos, next - pos);
+                size_t delim = line.find(';');
+                if (delim != std::string_view::npos) {
+                    std::string_view stationName = line.substr(0, delim);
+                    std::string_view tempStr = line.substr(delim + 1);
+                    float temperature = 0.0f;
+                    std::from_chars(tempStr.data(),
+                                    tempStr.data() + tempStr.size(),
+                                    temperature);
+                    auto& data = localMaps[tid][stationName];
+                    if (data.count == 0) {
+                        data.name = stationName;
+                        data.sum = temperature;
+                        data.count = 1;
                         data.min = temperature;
-                    if (temperature > data.max)
                         data.max = temperature;
+                    } else {
+                        data.sum += temperature;
+                        data.count++;
+                        if (temperature < data.min)
+                            data.min = temperature;
+                        if (temperature > data.max)
+                            data.max = temperature;
+                    }
                 }
             }
+            pos = next + 1;
         }
     };
 
-    // Divide work into chunks and enqueue tasks in the thread pool.
+    // Enqueue tasks to the thread pool.
     Threadpool pool(numThreads);
-    size_t totalLines = lines.size();
-    size_t chunkSize = totalLines / numThreads;
-    size_t remainder = totalLines % numThreads;
-    size_t startIdx = 0;
     for (unsigned int tid = 0; tid < numThreads; tid++) {
-        size_t extra = (tid < remainder) ? 1 : 0;
-        size_t endIdx = startIdx + chunkSize + extra;
-        pool.addTask([=, &localMaps, &lines, &worker]() {
-            worker(startIdx, endIdx, tid);
+        auto [chunkStart, chunkEnd] = chunks[tid];
+        pool.addTask([=, &worker]() {
+            worker(chunkStart, chunkEnd, tid);
         });
-        startIdx = endIdx;
     }
-    // Wait until all tasks finish.
+    int tasks_left = pool.ReturnJobs();
+    printf("Tasks left: %d\n", tasks_left);
     pool.wait();
     pool.stop();
 
-    // Merge local maps into a global map.
-    std::map<std::string, WSData> stations;
+    // Merging all workers local maps
+    std::map<std::string_view, WSData> stations;
     for (const auto &localMap : localMaps) {
         for (const auto &pair : localMap) {
-            const std::string &stationName = pair.first;
+            std::string_view stationName = pair.first;
             const WSData &localData = pair.second;
             auto &globalData = stations[stationName];
-            if (globalData.count == 0) {
+            if (globalData.count == 0)
                 globalData = localData;
-            } else {
+            else {
                 globalData.sum += localData.sum;
                 globalData.count += localData.count;
                 if (localData.min < globalData.min)
@@ -134,7 +150,6 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Compute averages.
     for (auto &pair : stations) {
         WSData &data = pair.second;
         data.average = data.sum / data.count;
@@ -142,21 +157,19 @@ int main(int argc, char* argv[])
 
     // Sort results based on maximum temperature (descending).
     std::vector<WSData> sortedStations;
-    for (const auto &pair : stations) {
+    for (const auto &pair : stations)
         sortedStations.push_back(pair.second);
-    }
     std::sort(sortedStations.begin(), sortedStations.end(),
               [](const WSData &a, const WSData &b) {
                   return a.max > b.max;
               });
 
     for (const auto &data : sortedStations) {
-        std::cout << data.name << ": avg=" << data.average 
-                  << " min=" << data.min 
+        std::cout << data.name << ": avg=" << data.average
+                  << " min=" << data.min
                   << " max=" << data.max << std::endl;
     }
 
-    // Unmap file memory.
     munmap(fileData, filesize);
 
     return 0;

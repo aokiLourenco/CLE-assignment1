@@ -65,3 +65,7 @@ void Threadpool::stop() {
             t.join();
     }
 }
+
+int Threadpool::ReturnJobs() {
+    return tasksLeft;
+}

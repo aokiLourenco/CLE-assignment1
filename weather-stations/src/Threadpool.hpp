@@ -25,6 +25,7 @@ public:
     void addTask(std::function<void()> task);
     void wait();  
     void stop();
+    int ReturnJobs();
 private:
     std::vector<std::thread> threads;
     std::queue<std::function<void()>> tasks;
